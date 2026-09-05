@@ -68,9 +68,17 @@ Agent 类的结构图
 # 导入项目内的类
 # 等价于 TS: import MCPClient from "./MCPClient"
 # 等价于 Java: import com.xxx.MCPClient;
+import json
+import uuid
 from mcpCient import MCPClient  # MCP 客户端（每个实例连一个 MCP 服务器）
 from ChatOpenAI import ChatOpenAI  # LLM 聊天客户端（封装 OpenAI 兼容 API）
-from utils import logTile  # 日志工具：打印带 === 分隔线的标题
+from utils import logTile, safe_print,trace_id  # 日志工具
+
+from token_budget import TokenBudget
+# agent.py 顶部，和其他 import 放一起
+from memory_manager import MemoryManager
+from tool_register import ToolRegister,ToolDef
+from executor import MCPExecutor
 
 
 # ============================================================
@@ -166,6 +174,7 @@ class Agent:
         self.system_prompt = system_prompt
         self.context = context
         self.mcp_clients = mcp_clients
+        self.token_budget=TokenBudget("cl100k_base",100000)
 
         # ----- 二、LLM 客户端：延迟初始化 -----
         # Java: private ChatOpenAI llm = null;
@@ -255,6 +264,13 @@ class Agent:
             for client in self.mcp_clients
             for tool in client.get_tools()
         ]
+        self.register=ToolRegister()
+        for client in self.mcp_clients:
+            for t in client.get_tools():
+                self.register.register(
+                    ToolDef(name=t.name,description=t.description,input_schema=t.inputSchema),
+                    MCPExecutor(client=client,name=t.name),
+                )
 
         # ----- 创建 LLM 客户端 -----
         # 把 system_prompt、tools、context 注入 ChatOpenAI
@@ -331,7 +347,8 @@ class Agent:
     #   他看了结果说"今天晴，25°C"。
     #   这就是 invoke() 做的事。
     # ----------------------------------------------------------
-    async def invoke(self, prompt: str) -> str:
+    #user_id暂时用"1"
+    async def invoke(self, prompt: str,user_id:str="1", max_steps: int = 10) -> str:
         """
         执行一次交互：发送 prompt，循环处理工具调用，返回最终答案。
 
@@ -350,116 +367,202 @@ class Agent:
         #   等价于 Java 的 if (xxx == null)
         #   等价于 JS 的 if (!xxx)
         # None、空字符串、空列表、False、0 在布尔上下文中都是 False
-        if self.llm is None:
-            # raise = Java 的 throw
-            # RuntimeError = 标准异常类型（类似 Java 的 IllegalStateException）
-            raise RuntimeError(
-                "Agent 还没有初始化！请先调用 await agent.init()"
-            )
+        id=uuid.uuid4().hex[:12]
+        token=trace_id.set(id)
+        try:
+            if self.llm is None:
+                # raise = Java 的 throw
+                # RuntimeError = 标准异常类型（类似 Java 的 IllegalStateException）
+                raise RuntimeError(
+                    "Agent 还没有初始化！请先调用 await agent.init()"
+                )
 
-        # ----- 第1步：发送 prompt 给 LLM -----
-        # 等价于 TS: let response = await this.llm.chat(prompt);
-        # LLM 可能直接返回文字答案，也可能返回 tool_calls（"我需要调用工具"）
-        response = await self.llm.chat(prompt)
+            memory = MemoryManager() if user_id else None
 
-        # ----- 第2步：Tool-use 循环 -----
-        # while True = Java 的 while (true)
-        # Python 没有 do...while，但 while True + break 可以模拟任何循环
-        while True:
-            # tool_calls 是一个 list[dict]，每个元素形如：
-            #   {
-            #     "id": "call_abc123",
-            #     "function": {
-            #       "name": "read_file",
-            #       "arguments": '{"path": "/tmp/hello.txt"}'
-            #     }
-            #   }
-            #
-            # Python 的 if xxx: 对列表来说：
-            #   [] (空列表) → False → 跳过 if 块
-            #   [item]      → True  → 进入 if 块
-            if response["toolCalls"]:
-                # ----- 遍历每个 tool call -----
-                # Java: for (Map<String, Object> toolCall : response.getToolCalls())
-                for tool_call in response["toolCalls"]:
-                    # 从 tool call 中取出函数名
-                    # tool_call["function"]["name"] 等同于
-                    # Java: toolCall.get("function").get("name")
-                    func_name = tool_call["function"]["name"]
+            if memory:
+                short = await memory.load_short_term(user_id)
+                if short:
+                    safe_print(f"[短期记忆] 加载摘要: {short[:80]}...")
+                    self.llm.messages.append({
+                        "role": "system",
+                        "content": f"[用户上次对话摘要] {short}"
+                    })
 
-                    # ----- 查找能处理这个工具调用的 MCP 客户端 -----
-                    # Python 的 next() + 生成器表达式 = Java 的 Stream.findFirst()
-                    #
-                    # 拆解：
-                    #   (client for client in self.mcp_clients ...)
-                    #     ↑ 生成器表达式（generator expression）
-                    #     类似于 Java Stream 的惰性求值——用的时候才计算
-                    #
-                    #   if any(t.name == func_name for t in client.get_tools())
-                    #     ↑ any() = 有一个为 True 就返回 True
-                    #     ↑ t.name == func_name for t in ... = 内部又是一个生成器
-                    #
-                    #   next(..., None) = 取第一个匹配的，没有就返回 None
-                    #
-                    # Java 对比：
-                    #   Optional<MCPClient> mcp = mcpClients.stream()
-                    #       .filter(c -> c.getTools().stream()
-                    #           .anyMatch(t -> t.name.equals(funcName)))
-                    #       .findFirst();
-                    mcp = next(
-                        (
-                            client
-                            for client in self.mcp_clients
-                            if any(
-                                t.name == func_name
-                                for t in client.get_tools()
-                            )
-                        ),
-                        None,  # 默认值：没找到就返回 None
-                    )
+                long_docs = await memory.search_long_term(user_id,query=prompt,k=3)
+                if long_docs:
+                    safe_print(f"[长期记忆] 检索到 {len(long_docs)} 条相关历史")
+                    self.llm.messages.append({
+                        "role": "system",
+                        "content": "[用户历史相关记录]\n" + "\n".join(
+                            f"- {d[:200]}" for d in long_docs
+                        )
+                    })
 
-                    if mcp is not None:
-                        # ===== 有对应的 MCP 客户端 → 执行工具调用 =====
-                        logTile("TOOL USE")
+            # ----- 第1步：发送 prompt 给 LLM -----
+            # 等价于 TS: let response = await this.llm.chat(prompt);
+            # LLM 可能直接返回文字答案，也可能返回 tool_calls（"我需要调用工具"）
 
-                        # ----- 日志输出 -----
-                        # f-string（格式化字符串）：
-                        #   f"hello {name}" = Java: "hello " + name
-                        #   f"hello {name!r}" = 带 repr（调试输出）
-                        print(f"调用工具: {func_name}")
-                        print(f"参数: {tool_call['function']['arguments']}")
-
-                        # ----- 解析参数 -----
-                        # JSON.parse(toolCall.function.arguments) 的 Python 版
-                        # json.loads() = JSON string → Python 对象
+            try:
+                response = await self.llm.chat(prompt)
+                self.token_budget.recount(self.token_budget.count_messages(self.llm.messages))
+            except Exception as e:
+                original = getattr(e, '__cause__', e) or e
+                error_msg = str(original) or repr(original) or type(original).__name__
+                return json.dumps(
+                    {
+                        "status":"error",
+                        "component":"llm",
+                        "message":error_msg,
+                        "hint":"LLM服务多次重试后仍不可用，请检查API配置或稍后重试",
+                    },
+                    ensure_ascii=False
+                )
+            # ----- 第2步：Tool-use 循环 -----
+            # while True = Java 的 while (true)
+            # Python 没有 do...while，但 while True + break 可以模拟任何循环
+            #给一个step，防止重复多次
+            step=0
+            while step<max_steps:
+                if self.token_budget.exceeded:
+                    return "[已达到 Token 预算上限，任务中断]"
+                step+=1
+                # tool_calls 是一个 list[dict]，每个元素形如：
+                #   {
+                #     "id": "call_abc123",
+                #     "function": {
+                #       "name": "read_file",
+                #       "arguments": '{"path": "/tmp/hello.txt"}'
+                #     }
+                #   }
+                #
+                # Python 的 if xxx: 对列表来说：
+                #   [] (空列表) → False → 跳过 if 块
+                #   [item]      → True  → 进入 if 块
+                if response["toolCalls"]:
+                    # ----- 遍历每个 tool call -----
+                    # Java: for (Map<String, Object> toolCall : response.getToolCalls())
+                    for tool_call in response["toolCalls"]:
+                        # 从 tool call 中取出函数名
+                        # tool_call["function"]["name"] 等同于
+                        # Java: toolCall.get("function").get("name")
+                        func_name = tool_call["function"]["name"]
+                        '''
+                        # ----- 查找能处理这个工具调用的 MCP 客户端 -----
+                        # Python 的 next() + 生成器表达式 = Java 的 Stream.findFirst()
                         #
-                        # Python ↔ JSON 对照：
-                        #   JSON string  → Python str
-                        #   JSON number  → Python int/float
-                        #   JSON boolean → Python bool（注意大小写：True/False）
-                        #   JSON null    → Python None
-                        #   JSON array   → Python list
-                        #   JSON object  → Python dict
-                        import json
+                        # 拆解：
+                        #   (client for client in self.mcp_clients ...)
+                        #     ↑ 生成器表达式（generator expression）
+                        #     类似于 Java Stream 的惰性求值——用的时候才计算
+                        #
+                        #   if any(t.name == func_name for t in client.get_tools())
+                        #     ↑ any() = 有一个为 True 就返回 True
+                        #     ↑ t.name == func_name for t in ... = 内部又是一个生成器
+                        #
+                        #   next(..., None) = 取第一个匹配的，没有就返回 None
+                        #
+                        # Java 对比：
+                        #   Optional<MCPClient> mcp = mcpClients.stream()
+                        #       .filter(c -> c.getTools().stream()
+                        #           .anyMatch(t -> t.name.equals(funcName)))
+                        #       .findFirst();
+                        mcp = next(
+                            (
+                                client
+                                for client in self.mcp_clients
+                                if any(
+                                    t.name == func_name
+                                    for t in client.get_tools()
+                                )
+                            ),
+                            None,  # 默认值：没找到就返回 None
+                        )
+
+
+                        if mcp is not None:
+                            # ===== 有对应的 MCP 客户端 → 执行工具调用 =====
+                            logTile("TOOL USE")
+
+                            # ----- 日志输出 -----
+                            # f-string（格式化字符串）：
+                            #   f"hello {name}" = Java: "hello " + name
+                            #   f"hello {name!r}" = 带 repr（调试输出）
+                            safe_print(f"调用工具: {func_name}")
+                            safe_print(f"参数: {tool_call['function']['arguments']}")
+
+                            # ----- 解析参数 -----
+                            # JSON.parse(toolCall.function.arguments) 的 Python 版
+                            # json.loads() = JSON string → Python 对象
+                            #
+                            # Python ↔ JSON 对照：
+                            #   JSON string  → Python str
+                            #   JSON number  → Python int/float
+                            #   JSON boolean → Python bool（注意大小写：True/False）
+                            #   JSON null    → Python None
+                            #   JSON array   → Python list
+                            #   JSON object  → Python dict
+
+                            params = json.loads(tool_call["function"]["arguments"])
+
+                            # ----- 调用 MCP 工具 -----
+                            # mcp.call_tool() 是异步的，所以用 await
+                            # 返回值是 CallToolResult 对象（MCP SDK 的类型），不是 dict
+                            # 需要用 .content 提取实际内容
+                            try:
+                                # 实验 1 已结束，注释掉模拟故障
+                                # raise RuntimeError("模拟数据库连接超时")
+                                result = await mcp.call_tool(func_name, params)
+                                #result_text = '{"status": "error", "message": "数据库连接超时"}'
+
+                                # ----- 提取 CallToolResult 中的文本内容 -----
+                                # CallToolResult.content 是一个 list，每个元素有 .type 和 .text
+                                # 对 LLM 来说只需要文字，所以把 text 类型的块拼接起来
+                                result_text_parts: list[str] = []
+
+                                for block in result.content:
+                                    if hasattr(block, "text"):
+                                        result_text_parts.append(block.text)
+                                result_text = "\n".join(result_text_parts)
+                            except Exception as e:
+                                error_msg = str(e) or repr(e) or type(e).__name__
+                                result_text=json.dumps(
+                                    {
+                                        "status":"error",
+                                        "tool":func_name,
+                                        "message":error_msg,
+                                        "hint":"请尝试其他方式或告知用户当前无法完成此操作",
+                                    },
+                                    ensure_ascii=False,
+                                )
+
+                            # ----- 打印结果 -----
+                            safe_print(f"结果: {result_text}")
+
+                            # ----- 把工具结果追加到 LLM 对话上下文 -----
+                            # 关键！LLM 需要看到工具执行结果才能继续推理
+                            # 如果不调用 append_tool_result，LLM 就不知道工具返回了什么
+                            self.llm.append_tool_result(
+                                tool_call["id"],
+                                result_text,
+                            )
+
+                        else:
+                            # ===== 没有对应的 MCP 客户端 → 返回错误信息 =====
+                            # 这也是一种"结果"——告诉 LLM 这个工具不存在
+                            # LLM 看到后会尝试其他方式或报告给用户
+                            self.llm.append_tool_result(
+                                tool_call["id"],
+                                "Tool not found",
+                            )
+                    '''
                         params = json.loads(tool_call["function"]["arguments"])
-
-                        # ----- 调用 MCP 工具 -----
-                        # mcp.call_tool() 是异步的，所以用 await
-                        # 返回值是 CallToolResult 对象（MCP SDK 的类型），不是 dict
-                        # 需要用 .content 提取实际内容
-                        result = await mcp.call_tool(func_name, params)
-
-                        # ----- 提取 CallToolResult 中的文本内容 -----
-                        # CallToolResult.content 是一个 list，每个元素有 .type 和 .text
-                        # 对 LLM 来说只需要文字，所以把 text 类型的块拼接起来
-                        result_text_parts: list[str] = []
-                        for block in result.content:
-                            if hasattr(block, "text"):
-                                result_text_parts.append(block.text)
-                        result_text = "\n".join(result_text_parts)
-
+                        try:
+                            tool_result=await self.register.execute(func_name,params)
+                            result_text=tool_result.to_message()
+                        except KeyError as e:
+                            result_text = "Tool not found"
                         # ----- 打印结果 -----
-                        print(f"结果: {result_text}")
+                        safe_print(f"结果: {result_text}")
 
                         # ----- 把工具结果追加到 LLM 对话上下文 -----
                         # 关键！LLM 需要看到工具执行结果才能继续推理
@@ -468,31 +571,158 @@ class Agent:
                             tool_call["id"],
                             result_text,
                         )
-                    else:
-                        # ===== 没有对应的 MCP 客户端 → 返回错误信息 =====
-                        # 这也是一种"结果"——告诉 LLM 这个工具不存在
-                        # LLM 看到后会尝试其他方式或报告给用户
-                        self.llm.append_tool_result(
-                            tool_call["id"],
-                            "Tool not found",
-                        )
 
-                # ----- 工具调用全部处理完毕，让 LLM 继续对话 -----
-                # 这次不带 prompt 参数——LLM 从对话历史中看到工具结果，
-                # 自动决定下一步：是继续调用工具？还是输出最终答案？
-                response = await self.llm.chat()
+                    # ----- 工具调用全部处理完毕，让 LLM 继续对话 -----
+                    # 这次不带 prompt 参数——LLM 从对话历史中看到工具结果，
+                    # 自动决定下一步：是继续调用工具？还是输出最终答案？
+                    response = await self.llm.chat()
+                    self.token_budget.recount(self.token_budget.count_messages(self.llm.messages))
+                    # continue = 回到 while True 的开头，检查新一轮的 tool_calls
+                    # Java: continue;
+                    # 效果一样：跳过本轮循环剩余部分，进入下一次判断
 
-                # continue = 回到 while True 的开头，检查新一轮的 tool_calls
-                # Java: continue;
-                # 效果一样：跳过本轮循环剩余部分，进入下一次判断
-                continue
+                    if self.token_budget.should_compact():
+                        await self.compact_old_messages(keep_recent=4)
 
-            # ----- 没有 tool_calls → LLM 给出了最终答案 -----
-            # 跳出循环，准备返回结果
-            break
+                    continue
 
-        # ----- 第3步：返回结果 -----
-        return response["content"]
+                # ----- 没有 tool_calls → LLM 给出了最终答案 -----
+                # 跳出循环，准备返回结果
+                break
+            if memory:
+                sys_msg = [m for m in self.llm.messages if m.get("role") == "system"]
+                oth_msg = [m for m in self.llm.messages if m.get("role") != "system"]
+                # 只总结整段对话，【不改】messages、不 mark_summarized
+                summary = await self.summarize(sys_msg=sys_msg, to_be_summarize=oth_msg) # type: ignore
+                if summary:
+                    await memory.save_short_term(user_id, summary)
+                    safe_print("[短期记忆] 摘要已保存")
+
+                await memory.save_long_term(
+                    question=prompt,
+                    user_id=user_id,#暂时用“1”
+                    answer=response["content"][:500],
+                )
+
+            # ----- 第3步：返回结果 -----
+            return response["content"]
+        finally:
+            trace_id.reset(token)
+
+    async def invoke_stream(self, prompt: str, max_steps: int = 10):
+        id=uuid.uuid4().hex[:12]
+        token=trace_id.set(id)
+        try:
+
+            """流式版 invoke:工具循环每一轮都走 chat_stream,边收边 yield。"""
+            if self.llm is None:
+                raise RuntimeError("Agent 还没有初始化！请先调用 await agent.init()")
+
+            step = 0
+            while step < max_steps:
+                step += 1
+                if self.token_budget.exceeded:
+                    yield "[已达到 Token 预算上限，任务中断]"
+                    return
+
+                # 每轮重新攒,不残留上一轮的 tool_calls
+                content = ""
+                tool_calls: list[dict] = []
+
+                # 第一轮带 prompt,后续轮不带(上下文已在 messages 里)
+                async for delta in self.llm.chat_stream(prompt if step == 1 else ""):
+                    if delta.content:
+                        content += delta.content
+                        yield delta.content
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            while len(tool_calls) <= tc.index:
+                                tool_calls.append({"id": "", "function": {"name": "", "arguments": ""}})
+                            cur = tool_calls[tc.index]
+                            if tc.id:
+                                cur["id"] += tc.id
+                            if tc.function and tc.function.name:
+                                cur["function"]["name"] += tc.function.name
+                            if tc.function and tc.function.arguments:
+                                cur["function"]["arguments"] += tc.function.arguments
+
+                # 收尾:append assistant(含 tool_calls)
+                self.llm.append_assistant(content, tool_calls)
+
+                if not tool_calls:
+                    break  # 这轮没工具调用 → 结束
+
+                # 执行这轮的工具
+                for tool_call in tool_calls:
+                    func_name = tool_call["function"]["name"]
+                    params = json.loads(tool_call["function"]["arguments"])
+                    try:
+                        tool_result = await self.register.execute(func_name, params)
+                        result_text = tool_result.to_message()
+                    except KeyError:
+                        result_text = "Tool not found"
+                    safe_print(f"结果: {result_text}")
+                    self.llm.append_tool_result(tool_call["id"], result_text)
+
+                # 回 while 顶部,开新一轮(不带 prompt)
+        finally:
+            trace_id.reset(token)
+
+
+
+    async def compact_old_messages(self,keep_recent:int=4):
+        assert self.llm is not None
+        messages=self.llm.messages
+        sys_msg=[m for m in messages if m.get("role")=="system"]
+        oth_msg=[m for m in messages if m.get("role")!="system"]
+
+        if len(oth_msg)<=2+keep_recent:
+            return ""
+
+        middle=oth_msg[:-keep_recent]
+        recent=oth_msg[-keep_recent:]
+
+        if len(middle)<=2:
+            return ""
+
+        compacted=await self.summarize(sys_msg=sys_msg,to_be_summarize=middle) # type: ignore
+
+        #新增摘要
+        summary_msg={"role": "system", "content": f"[之前对话摘要] {compacted}"}
+        self.llm.messages=sys_msg+[summary_msg]+recent # type: ignore
+        #重新计算token
+        self.token_budget.recount(self.token_budget.count_messages(self.llm.messages))
+        self.token_budget.mark_summarized()
+
+        return compacted
+
+    async def summarize(self,sys_msg:list[dict],to_be_summarize:list[dict]):
+
+        summary_prompt=(
+            "请用 200 字以内总结以下对话的关键信息，包括：\n"
+            "- 讨论了哪些话题\n"
+            "- 用户问了什么问题、有什么需求\n"
+            "- 重要的结论或知识点\n\n"
+            "对话内容：\n"
+            f"{json.dumps(to_be_summarize, ensure_ascii=False, default=str)}\n\n"
+            "只返回摘要文本，不要加任何前缀。"
+        )
+
+        assert self.llm is not None
+        saved_messages=self.llm.messages
+        self.llm.messages=sys_msg+[{"role":"user","content":summary_prompt}] # type: ignore
+
+        try:
+            summary_response=await self.llm.chat()
+            summary=summary_response["content"].strip()
+        except Exception as e:
+            safe_print(f"压缩失败:{e}")
+            self.llm.messages=saved_messages
+            return ""
+
+        self.llm.messages=saved_messages
+
+        return summary
 
 
 # ============================================================
@@ -544,3 +774,32 @@ class Agent:
 #     # 相当于 Java 的: ExecutorService.submit(task).get()
 #     import asyncio
 #     asyncio.run(example())
+async def example():
+    filesystem_client = MCPClient(
+        name="filesystem",
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-filesystem", "."],
+    )
+    agent=Agent(
+        model="deepseek-chat",
+        mcp_clients=[filesystem_client],
+        system_prompt="你是一个文件助手"
+    )
+    questions = [
+        "读取并概况当前目录的source.*的文件",
+    ]
+    answer:list[str]=[]
+    await agent.init()
+    for q in questions:
+        #answer.append(await agent.invoke(q,"1"))
+        async for s in agent.invoke_stream(q):
+            print(s,end="",flush=True)
+    print()
+    await agent.close()  # 显式清理，避免 npx 进程残留
+    #print(f"\n最终答案: {answer}")
+
+if __name__ == "__main__":
+    #asyncio.run() = 启动异步事件循环
+    #相当于 Java 的: ExecutorService.submit(task).get()
+    import asyncio
+    asyncio.run(example())

@@ -9,6 +9,8 @@ __pycache__/
 .venv/
 venv/
 ENV/
+.pytest_cache/
+.pytest-tmp/
 
 # IDE
 .idea/
@@ -19,6 +21,16 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code local state
+.claude/
+
+# Logs
+*.log
+
+# Local runtime databases
+chroma_memory/
+rag_chroma/
 
 # me
 my/

@@ -20,6 +20,8 @@ from openai.types.chat import (
 )
 from openai.types.shared_params.function_definition import FunctionDefinition
 
+from tenacity import retry,stop_after_attempt,wait_exponential,retry_if_exception_type
+
 # 导入项目内的工具函数
 # 等价于 TS 的 import { logTitle } from "./utils"
 from utils import logTile
@@ -56,6 +58,7 @@ class ChatOpenAI:
         system_prompt: str = "",
         tools: Optional[list[Tool]] = None,
         context: str = "",
+        max_history:int=12
     ) -> None:
         """
         参数说明：
@@ -95,6 +98,9 @@ class ChatOpenAI:
             self.messages.append({"role": "system", "content": system_prompt})
         if context:
             self.messages.append({"role": "user", "content": context})
+
+        #最大上下文
+        self.max_history=max_history
 
     # ----------------------------------------------------------
     # 私有方法：把 MCP Tool 转换成 OpenAI 格式
@@ -138,11 +144,19 @@ class ChatOpenAI:
     # async def = JS 的 async function
     # 返回类型 -> dict 表示返回一个字典
     # ----------------------------------------------------------
+    @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1,min=1,max=10),
+            retry=retry_if_exception_type((Exception,)),
+    )
     async def chat(self, prompt: str = "") -> dict:
         """发送 prompt，流式返回 { content, toolCalls }"""
 
         # ----- 打印标题 -----
         logTile("CHAT")  # 等价于 TS: logTitle('CHAT')
+
+        # 实验 2 已结束，注释掉模拟限流
+        # raise Exception("429 Too Many Requests — 模拟限流")
 
         # ----- 添加用户消息 -----
         if prompt:
@@ -211,9 +225,7 @@ class ChatOpenAI:
                     if tool_chunk.function and tool_chunk.function.name:
                         current["function"]["name"] += tool_chunk.function.name
                     if tool_chunk.function and tool_chunk.function.arguments:
-                        current["function"]["arguments"] += (
-                            tool_chunk.function.arguments
-                        )
+                        current["function"]["arguments"] += tool_chunk.function.arguments
 
         # ----- 换行（流式输出结束）-----
         print()
@@ -234,11 +246,68 @@ class ChatOpenAI:
             ]
         self.messages.append(cast(ChatCompletionMessageParam, assistant_msg))
 
+        self.__trim_context()
+
         # ----- 返回结果 -----
         return {
             "content": content,
             "toolCalls": tool_calls,
         }
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1,min=1,max=10),
+        retry=retry_if_exception_type((Exception,)),
+    )
+    async def chat_stream(self, prompt: str = ""):
+        """发送 prompt，流式返回 { content, toolCalls }"""
+
+        # ----- 打印标题 -----
+        logTile("CHAT")  # 等价于 TS: logTitle('CHAT')
+
+        # 实验 2 已结束，注释掉模拟限流
+        # raise Exception("429 Too Many Requests — 模拟限流")
+
+        # ----- 添加用户消息 -----
+        if prompt:
+            self.messages.append({"role": "user", "content": prompt})
+
+        # ----- 准备 tools 参数 -----
+        # 空列表不传 tools（避免 API 报错）
+        tools_def = self._get_tools_definition()
+
+        # ----- 发起流式请求 -----
+        # Python 的类型检查器比较严格，这里用 if/else 分两路处理
+        # 有 tools 和没有 tools 走不同的 create() 重载
+        if tools_def:
+            stream = await self.llm.chat.completions.create(
+                model=self.model,
+                messages=self.messages,
+                stream=True,
+                tools=tools_def,
+            )
+        else:
+            stream = await self.llm.chat.completions.create(
+                model=self.model,
+                messages=self.messages,
+                stream=True,
+            )
+
+
+
+        # ----- 流式读取 response -----
+        logTile("RESPONSE")
+
+        # async for = JS 的 for await...of
+        # 逐块读取流式输出
+        async for chunk in stream:
+            # 原样透传整个 delta 对象。
+            # 不 yield delta.content(字符串)或 delta.tool_calls(列表)——
+            # 那会让消费方一会儿拿到 str、一会儿拿到 list,没法统一处理。
+            # 整个 delta 交出去,消费方永远拿到同一个类型,自己判 .content / .tool_calls。
+            yield chunk.choices[0].delta
+
+
 
     # ----------------------------------------------------------
     # 把工具执行结果追加到消息历史
@@ -254,3 +323,52 @@ class ChatOpenAI:
                 "tool_call_id": tool_call_id,
             })
         )
+        self.__trim_context()
+
+    # ----------------------------------------------------------
+    # append_assistant() - 把 assistant 回复(含 tool_calls)写入历史并裁剪
+    #
+    # 为什么抽成公开方法:
+    #   原来这段逻辑在 chat() 内部(攒完 content/tool_calls 后 append + trim)。
+    #   chat_stream() 变成纯透传后,这段「收尾」要由消费方(agent)在流结束后调用。
+    #   agent 不该直接摸 self.messages 和私有 __trim_context(),所以封装成公开方法。
+    # ----------------------------------------------------------
+    def append_assistant(self, content: str, tool_calls: list[dict]) -> None:
+        """把 assistant 回复(含 tool_calls)追加进历史,并裁剪上下文。"""
+        assistant_msg: dict = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant_msg["tool_calls"] = [
+                {"id": c["id"], "type": "function", "function": c["function"]}
+                for c in tool_calls
+            ]
+        self.messages.append(cast(ChatCompletionMessageParam, assistant_msg))
+        self.__trim_context()
+
+    #裁剪对话，防止上下文溢出
+    def __trim_context(self):
+        system_message=[m for m in self.messages if m.get("role")=="system"]
+        other_message=[m for m in self.messages if m.get("role")!="system"]
+        if len(other_message)>self.max_history:
+            keep=other_message[-self.max_history:]
+            while keep and keep[0].get("role")=="tool":
+                keep=keep[1:]
+            self.messages=system_message+keep
+
+
+# ============================================================
+# 流式 demo:验证 chat_stream 是否一个字一个字往外冒
+# 运行:python ChatOpenAI.py
+# 现象:字一个接一个蹦出来,而不是一次性整段出现
+# ============================================================
+async def _demo_stream():
+    llm = ChatOpenAI(model="deepseek-chat", system_prompt="你是个助手")
+    async for delta in llm.chat_stream("用一句话介绍你自己"):
+        if delta.content:
+            print(delta.content, end="", flush=True)
+    print()
+
+if __name__ == "__main__":
+    import asyncio
+    from dotenv import load_dotenv
+    load_dotenv()  # 单独跑本文件时,mcpCient 没被 import,需手动加载 .env
+    asyncio.run(_demo_stream())

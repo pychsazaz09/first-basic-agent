@@ -12,18 +12,22 @@ Python 新手阅读指南：
 """
 
 import asyncio
-import sys
+import os
 from typing import Any, Optional
 from contextlib import AsyncExitStack
+from anyio import ClosedResourceError
+
 
 # ----- Windows 中文环境：强制 stdout 使用 UTF-8 -----
 # 否则 rich 输出中文会 throw UnicodeEncodeError（GBK 无法编码）
 # sys.stdout.reconfigure() 是 Python 3.7+ 的功能
-if sys.platform == "win32":
+# 万一不支持也不影响运行
+'''if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
     except Exception:
-        pass  # 万一不支持也不影响运行
+        pass'''
+
 
 # MCP SDK 的核心类
 # ClientSession  : 与 MCP 服务器的会话，发送/接收消息都靠它
@@ -40,6 +44,8 @@ from dotenv import load_dotenv
 from utils import logTile  # 项目内的日志小工具
 
 load_dotenv()  # 加载 .env 文件中的环境变量
+
+_DEVNULL = open(os.devnull, "w")   # os.devnull → "nul"，类型是 TextIO，IDE 不再报红
 
 
 # ============================================================
@@ -92,8 +98,6 @@ class MCPClient:
         self.args = args
 
         # ----- 二、延迟初始化的属性 -----
-        # 这些要等 connect 之后才有值，所以先设为 None
-        # Optional[X] 等价于 TS 的 X | null
         self.session: Optional[ClientSession] = None
 
         # ----- 三、AsyncExitStack：Python 的异步资源管理器 -----
@@ -233,7 +237,7 @@ class MCPClient:
         #   const transport = await stdio_client(serverParams)
         #   // ... 用完需要手动关闭
         stdio_transport = await self.exit_stack.enter_async_context(
-            stdio_client(server_params),
+            stdio_client(server_params, errlog=_DEVNULL),
         )
 
         # stdio_transport 是一个元组 (read_stream, write_stream)
@@ -285,6 +289,15 @@ class MCPClient:
             [tool.name for tool in self.tools],
         )
 
+    async def _reconnect(self) -> None:
+        """连接断开后重建：关旧资源 → 换新 exit_stack → 重新握手。"""
+        await self.exit_stack.aclose()      # 杀掉旧的 node 子进程、关旧流
+        self.exit_stack = AsyncExitStack()  # exit_stack 关闭后不能复用，必须换新的
+        self.session = None
+        self.tools = []
+        await self._connect_to_server()     # 重新 spawn + initialize + list_tools
+
+
     # ----------------------------------------------------------
     # 调用工具
     #
@@ -315,7 +328,13 @@ class MCPClient:
 
         # session.call_tool() 发送 MCP 请求并等待结果
         # 底层走的是 JSON-RPC over stdio
-        return await self.session.call_tool(name, params)
+        try:
+            return await self.session.call_tool(name, params)
+        except ClosedResourceError:
+            rprint(f"[MCP] 连接断开，自动重连后重试: {name}")
+            await self._reconnect()
+            return await self.session.call_tool(name, params)
+
 
 
 # ============================================================
